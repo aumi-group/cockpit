@@ -1,0 +1,73 @@
+name: Pulso · coleta de sinais
+
+on:
+  schedule:
+    # A cada 15min (cron do Actions usa UTC, sem segundos)
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}    # botão "Run workflow" manual no GitHub UI
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pulso
+  cancel-in-progress: false
+
+jobs:
+  pulso:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install deps (production only)
+        run: npm ci --omit=dev --no-audit --no-fund || npm install --omit=dev --no-audit --no-fund
+
+      - name: Apply DB schema (idempotente)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          npm install pg dotenv --no-audit --no-fund
+          node -e "
+            const {Pool}=require('pg');
+            const p=new Pool({connectionString:process.env.DATABASE_URL,ssl:{rejectUnauthorized:false}});
+            const ddl=require('fs').readFileSync('db/schema.sql','utf8');
+            (async()=>{
+              const c=await p.connect();
+              try{await c.query(ddl);console.log('schema ok')}
+              catch(e){console.error('schema:',e.message)}
+              finally{c.release();p.end()}
+            })();
+          "
+
+      - name: Run pulso worker (1 tick)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: node workers/pulso.mjs --once
+
+      - name: Summary
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          node -e "
+            const {Pool}=require('pg');
+            const p=new Pool({connectionString:process.env.DATABASE_URL,ssl:{rejectUnauthorized:false}});
+            (async()=>{
+              const r=await p.query(\"select source, count(*)::int as c from cockpit_signals group by source order by source\");
+              const tot=await p.query('select count(*)::int as c from cockpit_signals');
+              const last=await p.query(\"select source, title, fetched_at from cockpit_signals order by fetched_at desc limit 5\");
+              console.log('=== Sinais totais no banco ===');
+              for(const row of r.rows) console.log(' ',row.source.padEnd(14),row.c);
+              console.log('  TOTAL:',tot.rows[0].c);
+              console.log('=== Últimos 5 ===');
+              for(const row of last.rows) console.log(' ',row.fetched_at.toISOString(),row.source,'·',(row.title||'').slice(0,80));
+              p.end();
+            })();
+          "
