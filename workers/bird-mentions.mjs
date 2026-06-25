@@ -23,7 +23,7 @@ config({ path: new URL('../.env.local', import.meta.url) });
 
 const sql = neon(process.env.DATABASE_URL);
 const BIRD = process.platform === 'win32'
-  ? 'C:\\Users\\blzja\\AppData\\Roaming\\nvm\\v22.22.3\\bird.cmd'
+  ? 'C:\\Users\\blzja\\AppData\\Roaming\\nvm\\v22.0.0\\bird.cmd'
   : 'bird';
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -34,7 +34,12 @@ function runBird(args) {
     const env = { ...process.env };
     if (process.env.AUTH_TOKEN) env.AUTH_TOKEN = process.env.AUTH_TOKEN;
     if (process.env.CT0) env.CT0 = process.env.CT0;
-    const proc = spawn(BIRD, args, { env, shell: false });
+    // .cmd files no Windows precisam de shell:true + aspas em args com espaços
+    const isWin = process.platform === 'win32';
+    const finalArgs = isWin
+      ? args.map(a => /[\s"]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a)
+      : args;
+    const proc = spawn(BIRD, finalArgs, { env, shell: isWin });
     let stdout = '', stderr = '';
     proc.stdout.on('data', d => stdout += d);
     proc.stderr.on('data', d => stderr += d);
@@ -46,13 +51,28 @@ function runBird(args) {
 }
 
 function parseTweets(stdout) {
-  // bird saída padrão é texto formatado. JSON precisa de --json se suportado, senão parse manual.
-  // Estratégia robusta: tenta JSON primeiro, cai pra regex.
-  try {
-    const json = JSON.parse(stdout);
-    if (Array.isArray(json)) return json;
-    if (json.tweets) return json.tweets;
-  } catch { /* fallthrough */ }
+  // bird --json retorna array. Mas tem warning do node antes.
+  // Limpa warnings antes do '['
+  const jsonStart = stdout.indexOf('[');
+  if (jsonStart >= 0) {
+    try {
+      const json = JSON.parse(stdout.slice(jsonStart));
+      if (Array.isArray(json)) {
+        // bird --json output schema: {id, text, author: {handle, name}, created_at, ...}
+        return json.map(t => ({
+          id_str: String(t.id),
+          full_text: t.text || '',
+          user: { screen_name: t.author?.handle || t.user?.screen_name || 'unknown' },
+          created_at: t.created_at,
+          favorite_count: t.like_count || t.favorite_count || 0,
+          retweet_count: t.retweet_count || 0,
+          reply_count: t.reply_count || 0,
+          quote_count: t.quote_count || 0,
+          view_count: t.view_count || 0
+        }));
+      }
+    } catch { /* fallthrough */ }
+  }
   // Parse manual de "ID: 12345... | @handle | <text>" estilo bird text output.
   const tweets = [];
   const blocks = stdout.split(/\n\s*\n/);
@@ -149,7 +169,7 @@ async function sendTelegram(text) {
 async function processQuery(q) {
   console.log(`→ [${q.source}] ${q.query}`);
   try {
-    const out = await runBird(['search', q.query, '--limit', '50']);
+    const out = await runBird(['search', q.query, '--json']);
     const tweets = parseTweets(out);
     let inserted = 0;
     for (const t of tweets) {
@@ -177,7 +197,7 @@ async function processQuery(q) {
 async function processActor(a) {
   console.log(`→ actor @${a.handle}`);
   try {
-    const out = await runBird(['user-tweets', a.handle.replace(/^@/, ''), '--limit', '10']);
+    const out = await runBird(['user-tweets', a.handle.replace(/^@/, ''), '--json']);
     const tweets = parseTweets(out);
     let inserted = 0;
     for (const t of tweets) {
